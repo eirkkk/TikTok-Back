@@ -1,0 +1,297 @@
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 7bf3ca22566..ee78054173c 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2412,6 +2412,14 @@ void __wine_main( int argc, char *argv[], char *envp[] )
+         {
+             static char noexec[] = "WINELOADERNOEXEC=1";
+             char **new_argv = malloc( (argc + 2) * sizeof(*argv) );
++ #ifdef _WIN64
++             {
++                 Dl_info info = { 0 };
++                 dladdr(&__wine_main, &info);
++                 setenv("LD_PRELOAD", info.dli_fname, 1);
++             }
++#endif
++            
+ 
+             memcpy( new_argv + 1, argv, (argc + 1) * sizeof(*argv) );
+             putenv( noexec );
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 24653904308..d0bb51e41f1 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1252,9 +1252,9 @@ static const char *init_server_dir( dev_t dev, ino_t ino )
+     strcpy( dir, config_dir );
+     strcat( dir, "/.wineserver/server-" );
+ #else
+-    len += sizeof("/tmp/.wine-") + 12;
++    len += sizeof("/data/data/com.termux/files/usr/tmp/.wine-") + 12;
+     dir = malloc( len );
+-    sprintf( dir, "/tmp/.wine-%u/server-", getuid() );
++    sprintf( dir, "/data/data/com.termux/files/usr/tmp/.wine-%u/server-", getuid() );
+ #endif
+     p = dir + strlen( dir );
+     if (dev != (unsigned long)dev)
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index f027c0e4b85..aa990eae6ad 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -224,6 +224,241 @@ struct range_entry
+ static struct range_entry *free_ranges;
+ static struct range_entry *free_ranges_end;
+ 
++#ifdef _WIN64
++
++#include <sys/syscall.h>
++#include <stdatomic.h>
++#include <stdint.h>
++
++
++static void* mmap_native(void *addr, size_t size, int prot, int flags, int fd, off_t offset)
++{
++    return (void*)syscall(SYS_mmap, addr, size, prot, flags, fd, offset);
++}
++
++static int munmap_native(void* addr, size_t size)
++{
++    return (int)syscall(SYS_munmap, addr, size);
++}
++
++#define EXTMEM_LIMIT_HIGH 0x100000000
++#define EXTMEM_LIMIT_LOW  0x080000000
++#define EXTMEM_PAGE_INDEX(x) (((size_t)(x) - EXTMEM_LIMIT_LOW) / page_size)
++#define EXTMEM_GET_FLAG(x)   ((1 << (x)) - 1)
++
++static uint8_t* external_memory_flags;
++static size_t external_page_count;
++
++static volatile atomic_flag mmap_flag = ATOMIC_FLAG_INIT;
++
++static inline void mmap_lock(void)
++{
++    while (atomic_flag_test_and_set(&mmap_flag));
++}
++
++static inline void mmap_unlock(void)
++{
++    atomic_flag_clear(&mmap_flag);
++}
++
++static void set_external_page_flags(size_t page_start, size_t page_count)
++{
++    size_t page_end = page_start + page_count;
++    size_t page_1 = (page_start + 8) & (size_t)~7;
++    size_t page_2 = page_end & (size_t)~7;
++    uint8_t flags;
++    if (page_end <= page_1)
++    {
++        flags = EXTMEM_GET_FLAG(page_count) << (page_start & 7);
++        external_memory_flags[page_start >> 3] |= flags;
++        return;
++    }
++    flags = EXTMEM_GET_FLAG(page_1 - page_start) << (page_start & 7);
++    external_memory_flags[page_start >> 3] |= flags;
++    flags = EXTMEM_GET_FLAG(page_end - page_2);
++    external_memory_flags[page_end >> 3]   |= flags;
++    if (page_1 < page_2)
++    {
++        memset(external_memory_flags + (page_1 >> 3), -1, (page_2 - page_1) >> 3);
++    }
++}
++
++static void clear_external_page_flags(size_t page_start, size_t page_count)
++{
++    size_t page_end = page_start + page_count;
++    size_t page_1 = (page_start + 8) & (size_t)~7;
++    size_t page_2 = page_end & (size_t)~7;
++    uint8_t flags;
++    if (page_end <= page_1)
++    {
++        flags = EXTMEM_GET_FLAG(page_count) << (page_start & 7);
++        external_memory_flags[page_start >> 3] &= (uint8_t)~flags;
++        return;
++    }
++    flags = EXTMEM_GET_FLAG(page_1 - page_start) << (page_start & 7);
++    external_memory_flags[page_start >> 3] &= (uint8_t)~flags;
++    flags = EXTMEM_GET_FLAG(page_end - page_2);
++    external_memory_flags[page_end >> 3]   &= (uint8_t)~flags;
++    if (page_1 < page_2)
++    {
++        memset(external_memory_flags + (page_1 >> 3), 0, (page_2 - page_1) >> 3);
++    }
++}
++
++__attribute__((constructor)) void reserve_external_memory(void)
++{
++    size_t n;
++    mmap_native((void*)EXTMEM_LIMIT_LOW, EXTMEM_LIMIT_HIGH - EXTMEM_LIMIT_LOW, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0 );
++    external_page_count = (EXTMEM_LIMIT_HIGH - EXTMEM_LIMIT_LOW) / page_size;
++    n = external_page_count + page_size - 1;
++    n -= n % page_size;
++    external_memory_flags = mmap_native(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    memset(external_memory_flags, 0, n);
++}
++
++
++static size_t check_external_page_free(size_t page_start, size_t page_count)
++{
++    size_t i;
++    const size_t page_end = page_start + page_count;
++    for (i = page_start; i < page_end;)
++    {
++        uint8_t* pflags = external_memory_flags + (i >> 3);
++        if (!((i & 63) || *(uint64_t*)pflags))
++        {
++            i += 64;
++        }
++        else if (!((i & 31) || *(uint32_t*)pflags))
++        {
++            i += 32;
++        }
++        else if (!((i & 15) || *(uint16_t*)pflags))
++        {
++            i += 16;
++        }
++        else
++        {
++            const uint8_t flags = *pflags;
++            const size_t k = i & 7;
++            if (!(k || flags))
++                i += 8;
++            else if (flags >> k & 1)
++                break;
++            else
++                ++i;
++        }
++    }
++    return i < page_end ? i - page_start : page_count;
++}
++
++static size_t get_external_free_page(size_t page_count)
++{
++    size_t i;
++    for (i = 0; i < external_page_count;)
++    {
++        uint8_t* pflags = external_memory_flags + (i >> 3);
++        if (!((i & 63) || (uint64_t)~*(uint64_t*)pflags))
++        {
++            i += 64;
++        }
++        else if (!((i & 31) || (uint32_t)~*(uint32_t*)pflags))
++        {
++            i += 32;
++        }
++        else if (!((i & 15) || (uint16_t)~*(uint16_t*)pflags))
++        {
++            i += 16;
++        }
++        else
++        {
++            const uint8_t flags = *pflags;
++            const size_t k = i & 7;
++            if (!(k || (uint8_t)~flags))
++                i += 8;
++            else if (flags >> k & 1)
++                ++i;
++            else
++            {
++                size_t j = check_external_page_free(i, page_count);
++                if (j == page_count) return i;
++                i += j;
++            }
++        }
++    }
++    return (size_t)-1;
++}
++
++void *mmap64(void *addr, size_t size, int prot, int flags, int fd, off64_t offset)
++{
++    void* ret = NULL;
++    if (!size) return (void*)EXTMEM_LIMIT_LOW;
++    if ((size_t)addr < EXTMEM_LIMIT_HIGH && (size_t)addr + size > EXTMEM_LIMIT_HIGH)
++    {
++        FIXME("External mmap Memory cannot cross 0x100000000\n");
++        return NULL;
++    }
++    if ((size_t)addr < EXTMEM_LIMIT_LOW && (size_t)addr + size > EXTMEM_LIMIT_LOW)
++    {
++        FIXME("External mmap Memory cannot cross 0x80000000\n");
++        return NULL;
++    }
++    if (wow_peb && (!addr || ((size_t)addr >= EXTMEM_LIMIT_LOW && (size_t)addr < EXTMEM_LIMIT_HIGH)))
++    {
++        const size_t page_count = (size + page_size - 1) / page_size;
++        size_t page_index;
++        int f = flags | MAP_FIXED;
++        ret = addr;
++        mmap_lock();
++        if (ret)
++        {
++            page_index = EXTMEM_PAGE_INDEX(ret);
++            if (page_count != check_external_page_free(page_index, page_count))
++                goto finish;
++#if MAP_FIXED_NOREPLACE
++            if (f & MAP_FIXED_NOREPLACE) f &= ~MAP_FIXED_NOREPLACE;
++#endif
++        }
++        else
++        {
++            page_index = get_external_free_page(page_count);
++            if ((size_t)-1 == page_index) goto finish;
++            ret = (void*)(EXTMEM_LIMIT_LOW + page_index * page_size);
++        }
++        ret = mmap_native( ret, size, prot, f, fd, offset );
++        if ((void*)ret == (void*)-1 || !ret) ret = NULL;
++        else set_external_page_flags(page_index, page_count);
++finish:
++        mmap_unlock();
++    }
++    return ret ? ret : mmap_native( addr, size, prot, flags, fd, offset);
++}
++
++void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
++{
++    return mmap64(addr, length, prot, flags, fd, offset);
++}
++
++int munmap(void* addr, size_t size)
++{
++    if (wow_peb && (size_t)addr >= EXTMEM_LIMIT_LOW && (size_t)addr < EXTMEM_LIMIT_HIGH)
++    {
++        const size_t page_index = EXTMEM_PAGE_INDEX(addr);
++        const size_t page_count = (size + page_size - 1) / page_size;
++        mmap_lock();
++        mmap_native( addr, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0 );
++        clear_external_page_flags(page_index, page_count);
++        mmap_unlock();
++        return 0;
++    }
++    return munmap_native(addr, size);
++}
++
++#define mmap(addr, size, prot, flags, fd, offset) mmap_native(addr, size, prot, flags, fd, offset)
++
++#define munmap(addr, size) munmap_native(addr, size)
++
++#endif
++
+ 
+ static inline BOOL is_beyond_limit( const void *addr, size_t size, const void *limit )
+ {
+diff --git a/server/request.c b/server/request.c
+index 7021741c765..5a4a0dceaea 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -663,9 +663,9 @@ static char *create_server_dir( int force )
+     strcpy( server_dir, config_dir );
+     strcat( server_dir, "/.wineserver" );
+ #else
+-    len += sizeof("/tmp/.wine-") + 12;
++    len += sizeof("/data/data/com.termux/files/usr/tmp/.wine-") + 12;
+     if (!(server_dir = malloc( len ))) fatal_error( "out of memory\n" );
+-    sprintf( server_dir, "/tmp/.wine-%u", getuid() );
++    sprintf( server_dir, "/data/data/com.termux/files/usr/tmp/.wine-%u", getuid() );
+ #endif
+     create_dir( server_dir, &st2 );
+ 
